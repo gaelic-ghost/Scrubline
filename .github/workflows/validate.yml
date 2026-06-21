@@ -11,10 +11,10 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
@@ -22,7 +22,7 @@ jobs:
       - name: Verify the minimum supported Rust version
         run: |
           rustup toolchain install 1.85.0 --profile minimal
-          cargo +1.85.0 check --locked
+          cargo +1.85.0 test --locked
 
       - name: Check formatting
         run: cargo fmt --check

@@ -25,6 +25,9 @@ tools.
   stderr.
 - Preserve valid JSONL by parsing each line as one JSON value and serializing
   one valid JSON value per output line.
+- Preserve existing file destinations until the complete input succeeds. Keep
+  stdout streaming and document that later failures can leave a scrubbed prefix.
+- Keep the JSON nesting limit explicit and covered by regression tests.
 - Keep redaction deterministic. New rules must document their matching
   boundary, replacement marker, and false-positive tradeoff.
 - Use synthetic reserved-domain and documentation-range values in fixtures.
@@ -46,6 +49,7 @@ Run these commands serially:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo +1.85.0 test --locked
 cargo build --release
 ```
 
