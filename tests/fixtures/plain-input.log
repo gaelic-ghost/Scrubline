@@ -1,0 +1,4 @@
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.example.signature
+contact support@example.com from 192.0.2.42
+load /Users/example/Library/Logs/sample.log
+api_key=synthetic-key-123456789

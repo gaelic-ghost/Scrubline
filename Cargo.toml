@@ -1,0 +1,15 @@
+[package]
+name = "scrubline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A fast streaming CLI for removing secrets and personal information from logs."
+license = "Apache-2.0"
+repository = "https://github.com/gaelic-ghost/Scrubline"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
