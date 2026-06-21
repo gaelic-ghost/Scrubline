@@ -32,15 +32,17 @@ pub fn process(
         let scrubbed = match format {
             InputFormat::Text => redactor.redact(content, &mut counts),
             InputFormat::Jsonl => {
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
+                if content
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
                     return Err(AppError::InvalidJson {
                         line: line_number,
                         column: 1,
                         reason: "expected one JSON value on every JSONL line",
                     });
                 }
-                redact_json_line(trimmed, redactor, &mut counts).map_err(|error| {
+                redact_json_line(content, redactor, &mut counts).map_err(|error| {
                     AppError::InvalidJson {
                         line: line_number,
                         column: error.column,
@@ -112,5 +114,56 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn rejects_non_json_unicode_whitespace() {
+        let mut input = Cursor::new("\u{00a0}{\"ok\":true}\n".as_bytes());
+        let mut output = Vec::new();
+
+        let error = process(
+            &mut input,
+            &mut output,
+            InputFormat::Jsonl,
+            &Redactor::support_safe(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("column 1"));
+    }
+
+    #[test]
+    fn reports_columns_from_the_untrimmed_source_line() {
+        let mut input = Cursor::new(b"  {\"ok\":}\n");
+        let mut output = Vec::new();
+
+        let error = process(
+            &mut input,
+            &mut output,
+            InputFormat::Jsonl,
+            &Redactor::support_safe(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("column 9"));
+    }
+
+    #[test]
+    fn preserves_jsonl_crlf_and_missing_final_newline() {
+        let mut input = Cursor::new(b"{\"ok\":true}\r\n{\"ok\":false}");
+        let mut output = Vec::new();
+
+        process(
+            &mut input,
+            &mut output,
+            InputFormat::Jsonl,
+            &Redactor::support_safe(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"ok\":true}\r\n{\"ok\":false}"
+        );
     }
 }

@@ -67,7 +67,7 @@ impl Cli {
             {
                 format = InputFormat::parse(OsStr::new(value))?;
             } else if argument.to_string_lossy().starts_with('-') && argument != OsStr::new("-") {
-                return Err(CliError::UnknownOption(argument));
+                return Err(CliError::UnknownOption);
             } else {
                 set_input(&mut input, argument)?;
             }
@@ -119,7 +119,7 @@ pub enum CliError {
     MissingFormat,
     DuplicateOption(&'static str),
     UnsupportedFormat(OsString),
-    UnknownOption(OsString),
+    UnknownOption,
     MultipleInputs,
 }
 
@@ -145,10 +145,9 @@ impl fmt::Display for CliError {
                 "unsupported input format '{}'; choose 'text' or 'jsonl'",
                 value.to_string_lossy()
             ),
-            Self::UnknownOption(option) => write!(
+            Self::UnknownOption => write!(
                 formatter,
-                "unknown option '{}'; use --help to list supported options",
-                option.to_string_lossy()
+                "an unknown option was provided; use --help to list supported options"
             ),
             Self::MultipleInputs => write!(
                 formatter,

@@ -65,6 +65,20 @@ impl Redactor {
 
         output
     }
+
+    pub fn redact_json_value(
+        &self,
+        key: &str,
+        value: &str,
+        counts: &mut RedactionCounts,
+    ) -> String {
+        if is_api_key_label(key) && value.len() >= 8 && value != API_KEY_REPLACEMENT {
+            counts.record(Category::ApiKey);
+            API_KEY_REPLACEMENT.to_owned()
+        } else {
+            self.redact(value, counts)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,24 +108,21 @@ fn match_at(input: &str, start: usize) -> Option<RedactionMatch> {
 
 fn home_path_match(input: &str, start: usize) -> Option<RedactionMatch> {
     let bytes = input.as_bytes();
+    if !is_path_start_boundary(bytes, start) {
+        return None;
+    }
+
     let prefixes: &[&[u8]] = &[b"/Users/", b"/home/", b"~/"];
     let mut prefix_length = prefixes
         .iter()
         .find(|prefix| bytes[start..].starts_with(prefix))
         .map(|prefix| prefix.len());
 
-    if prefix_length.is_none()
-        && has_ascii_prefix(bytes, start, b"c:\\users\\")
-        && boundary_before(bytes, start, is_path_byte)
-    {
+    if prefix_length.is_none() && has_ascii_prefix(bytes, start, b"c:\\users\\") {
         prefix_length = Some(b"c:\\users\\".len());
     }
 
     let prefix_length = prefix_length?;
-    if start > 0 && bytes[start - 1] == b'/' {
-        return None;
-    }
-
     let mut end = start + prefix_length;
     while end < bytes.len() && is_path_byte(bytes[end]) {
         end += 1;
@@ -156,7 +167,7 @@ fn bearer_match(input: &str, start: usize) -> Option<RedactionMatch> {
 
 fn api_key_match(input: &str, start: usize) -> Option<RedactionMatch> {
     let bytes = input.as_bytes();
-    if !boundary_before(bytes, start, is_token_byte) {
+    if !boundary_before(bytes, start, is_token_body_byte) {
         return None;
     }
 
@@ -180,19 +191,12 @@ fn api_key_match(input: &str, start: usize) -> Option<RedactionMatch> {
         let end = consume_while(bytes, start + 4, |byte| {
             byte.is_ascii_uppercase() || byte.is_ascii_digit()
         });
-        if end - (start + 4) == 16 {
+        if end - (start + 4) == 16 && boundary_after(bytes, end, is_token_byte) {
             return Some(api_key_redaction(end));
         }
     }
 
-    for label in [
-        b"api_key".as_slice(),
-        b"api-key",
-        b"apikey",
-        b"access_token",
-        b"access-token",
-        b"token",
-    ] {
+    for label in API_KEY_LABELS {
         if !has_ascii_prefix(bytes, start, label) {
             continue;
         }
@@ -214,8 +218,17 @@ fn api_key_match(input: &str, start: usize) -> Option<RedactionMatch> {
             token_start += 1;
         }
 
+        let quote = bytes
+            .get(token_start)
+            .copied()
+            .filter(|byte| matches!(byte, b'"' | b'\''));
+        if quote.is_some() {
+            token_start += 1;
+        }
+
         let end = consume_while(bytes, token_start, is_token_byte);
-        if end - token_start >= 8 {
+        let has_closing_quote = quote.is_none() || bytes.get(end).copied() == quote;
+        if end - token_start >= 8 && has_closing_quote {
             let mut replacement = input[start..token_start].to_owned();
             replacement.push_str(API_KEY_REPLACEMENT);
             return Some(RedactionMatch {
@@ -237,6 +250,22 @@ fn api_key_redaction(end: usize) -> RedactionMatch {
     }
 }
 
+const API_KEY_LABELS: &[&[u8]] = &[
+    b"api_key",
+    b"api-key",
+    b"apikey",
+    b"access_token",
+    b"access-token",
+    b"accesstoken",
+    b"token",
+];
+
+fn is_api_key_label(label: &str) -> bool {
+    API_KEY_LABELS
+        .iter()
+        .any(|candidate| label.as_bytes().eq_ignore_ascii_case(candidate))
+}
+
 fn email_match(input: &str, start: usize) -> Option<RedactionMatch> {
     let bytes = input.as_bytes();
     if !is_email_local_byte(*bytes.get(start)?)
@@ -255,16 +284,14 @@ fn email_match(input: &str, start: usize) -> Option<RedactionMatch> {
     }
 
     let domain_start = local_end + 1;
-    let end = consume_while(bytes, domain_start, is_domain_byte);
+    let mut end = consume_while(bytes, domain_start, is_domain_byte);
+    while end > domain_start && bytes[end - 1] == b'.' {
+        end -= 1;
+    }
     let domain = &bytes[domain_start..end];
-    let last_dot = domain.iter().rposition(|byte| *byte == b'.')?;
-    if last_dot == 0
-        || last_dot + 3 > domain.len()
-        || domain.first() == Some(&b'-')
-        || domain.get(last_dot.wrapping_sub(1)) == Some(&b'-')
-        || domain.get(last_dot + 1) == Some(&b'-')
-        || !domain[last_dot + 1..].iter().all(u8::is_ascii_alphabetic)
-        || !boundary_after(bytes, end, is_domain_byte)
+    if bytes[start] == b'.'
+        || bytes[start..local_end].windows(2).any(|pair| pair == b"..")
+        || !is_valid_email_domain(domain)
     {
         return None;
     }
@@ -276,10 +303,44 @@ fn email_match(input: &str, start: usize) -> Option<RedactionMatch> {
     })
 }
 
+fn is_valid_email_domain(domain: &[u8]) -> bool {
+    let mut labels = domain.split(|byte| *byte == b'.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    let mut previous = first;
+    let mut label_count = 1;
+
+    if !is_valid_domain_label(first) {
+        return false;
+    }
+
+    for label in labels {
+        if !is_valid_domain_label(label) {
+            return false;
+        }
+        previous = label;
+        label_count += 1;
+    }
+
+    label_count >= 2 && previous.len() >= 2 && previous.iter().all(u8::is_ascii_alphabetic)
+}
+
+fn is_valid_domain_label(label: &[u8]) -> bool {
+    !label.is_empty()
+        && label.first().is_some_and(u8::is_ascii_alphanumeric)
+        && label.last().is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
 fn ipv4_match(input: &str, start: usize) -> Option<RedactionMatch> {
     let bytes = input.as_bytes();
     if !bytes.get(start)?.is_ascii_digit()
-        || !boundary_before(bytes, start, |byte| byte.is_ascii_digit() || byte == b'.')
+        || !boundary_before(bytes, start, |byte| {
+            byte.is_ascii_alphanumeric() || byte == b'.'
+        })
     {
         return None;
     }
@@ -305,7 +366,7 @@ fn ipv4_match(input: &str, start: usize) -> Option<RedactionMatch> {
         }
     }
 
-    if bytes.get(cursor).is_some_and(u8::is_ascii_digit)
+    if bytes.get(cursor).is_some_and(u8::is_ascii_alphanumeric)
         || (bytes.get(cursor) == Some(&b'.')
             && bytes.get(cursor + 1).is_some_and(u8::is_ascii_digit))
     {
@@ -325,7 +386,7 @@ fn ipv6_match(input: &str, start: usize) -> Option<RedactionMatch> {
         .get(start)
         .is_some_and(|byte| byte.is_ascii_hexdigit() || *byte == b':')
         || !boundary_before(bytes, start, |byte| {
-            byte.is_ascii_hexdigit() || byte == b':'
+            byte.is_ascii_alphanumeric() || byte == b':'
         })
     {
         return None;
@@ -337,6 +398,9 @@ fn ipv6_match(input: &str, start: usize) -> Option<RedactionMatch> {
     let candidate = &input[start..end];
     if candidate.bytes().filter(|byte| *byte == b':').count() < 2
         || Ipv6Addr::from_str(candidate).is_err()
+        || !boundary_after(bytes, end, |byte| {
+            byte.is_ascii_alphanumeric() || byte == b':'
+        })
     {
         return None;
     }
@@ -377,6 +441,10 @@ fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'-' | b'=')
 }
 
+fn is_token_body_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'-')
+}
+
 fn is_email_local_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
 }
@@ -390,6 +458,15 @@ fn is_path_byte(byte: u8) -> bool {
         && !matches!(
             byte,
             b'"' | b'\'' | b'<' | b'>' | b'|' | b',' | b';' | b')' | b']' | b'}'
+        )
+}
+
+fn is_path_start_boundary(bytes: &[u8], start: usize) -> bool {
+    start == 0
+        || bytes[start - 1].is_ascii_whitespace()
+        || matches!(
+            bytes[start - 1],
+            b'=' | b':' | b'"' | b'\'' | b'(' | b'[' | b'{'
         )
 }
 
@@ -441,5 +518,113 @@ mod tests {
 
         assert_eq!(output, "access_token: [REDACTED_API_KEY]");
         assert_eq!(counts.api_keys, 1);
+    }
+
+    #[test]
+    fn redacts_quoted_labelled_assignments() {
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact(
+            "api_key=\"abcdefghijklmnop\" token='qrstuvwxyz123456'",
+            &mut counts,
+        );
+
+        assert_eq!(
+            output,
+            "api_key=\"[REDACTED_API_KEY]\" token='[REDACTED_API_KEY]'"
+        );
+        assert_eq!(counts.api_keys, 2);
+    }
+
+    #[test]
+    fn preserves_sentence_punctuation_after_email_addresses() {
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact("Contact support@example.com.", &mut counts);
+
+        assert_eq!(output, "Contact [REDACTED_EMAIL].");
+        assert_eq!(counts.email_addresses, 1);
+    }
+
+    #[test]
+    fn handles_repeated_overlapping_and_boundary_cases_deterministically() {
+        let input = concat!(
+            "/Users/support@example.com/log ",
+            "support@example.com support@example.com ",
+            "notbearer abcdefgh Bearer abcdefgh, ",
+            "[2001:db8::1]."
+        );
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact(input, &mut counts);
+
+        assert_eq!(
+            output,
+            concat!(
+                "[REDACTED_HOME_PATH] ",
+                "[REDACTED_EMAIL] [REDACTED_EMAIL] ",
+                "notbearer abcdefgh Bearer [REDACTED_BEARER_TOKEN], ",
+                "[[REDACTED_IP_ADDRESS]]."
+            )
+        );
+        assert_eq!(counts.home_paths, 1);
+        assert_eq!(counts.email_addresses, 2);
+        assert_eq!(counts.bearer_tokens, 1);
+        assert_eq!(counts.ip_addresses, 1);
+        assert_eq!(counts.total(), 5);
+    }
+
+    #[test]
+    fn does_not_redact_a_prefix_of_a_longer_aws_key_candidate() {
+        let input = "AKIA1234567890ABCDEFx";
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact(input, &mut counts);
+
+        assert_eq!(output, input);
+        assert_eq!(counts.api_keys, 0);
+    }
+
+    #[test]
+    fn redacts_prefixed_api_keys_after_assignment_delimiters() {
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact(
+            "openai_key=sk-abcdefghijklmnop github=ghp_abcdefghijklmnop",
+            &mut counts,
+        );
+
+        assert_eq!(
+            output,
+            "openai_key=[REDACTED_API_KEY] github=[REDACTED_API_KEY]"
+        );
+        assert_eq!(counts.api_keys, 2);
+    }
+
+    #[test]
+    fn does_not_redact_ip_prefixes_embedded_in_alphanumeric_text() {
+        let input = "v192.168.1.1 192.168.1.1suffix x2001:db8::1 2001:db8::1suffix";
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact(input, &mut counts);
+
+        assert_eq!(output, input);
+        assert_eq!(counts.ip_addresses, 0);
+    }
+
+    #[test]
+    fn distinguishes_home_paths_from_url_segments() {
+        let mut counts = RedactionCounts::default();
+
+        let output = Redactor::support_safe().redact(
+            "https://example.com/Users/example/log path=/Users/example/log",
+            &mut counts,
+        );
+
+        assert_eq!(
+            output,
+            "https://example.com/Users/example/log path=[REDACTED_HOME_PATH]"
+        );
+        assert_eq!(counts.home_paths, 1);
     }
 }

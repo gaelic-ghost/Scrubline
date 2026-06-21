@@ -1,5 +1,7 @@
 use crate::redact::{RedactionCounts, Redactor};
 
+const MAX_NESTING_DEPTH: usize = 128;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JsonError {
     pub column: usize,
@@ -17,7 +19,7 @@ pub fn redact_json_line(
         redactor,
         counts,
     };
-    let output = parser.parse_value()?;
+    let output = parser.parse_value(0, None)?;
     parser.skip_whitespace();
     if parser.position != parser.input.len() {
         return Err(parser.error("unexpected content after the JSON value"));
@@ -33,16 +35,24 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
-    fn parse_value(&mut self) -> Result<String, JsonError> {
+    fn parse_value(&mut self, depth: usize, object_key: Option<&str>) -> Result<String, JsonError> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(self.error("JSON nesting exceeds the supported limit of 128"));
+        }
+
         self.skip_whitespace();
         match self.peek() {
             Some(b'"') => {
                 let value = self.parse_string()?;
-                let redacted = self.redactor.redact(&value, self.counts);
+                let redacted = if let Some(key) = object_key {
+                    self.redactor.redact_json_value(key, &value, self.counts)
+                } else {
+                    self.redactor.redact(&value, self.counts)
+                };
                 Ok(encode_string(&redacted))
             }
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
             Some(b't') => self.parse_literal(b"true"),
             Some(b'f') => self.parse_literal(b"false"),
             Some(b'n') => self.parse_literal(b"null"),
@@ -52,7 +62,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_object(&mut self) -> Result<String, JsonError> {
+    fn parse_object(&mut self, depth: usize) -> Result<String, JsonError> {
         self.position += 1;
         let mut output = String::from("{");
         self.skip_whitespace();
@@ -74,7 +84,7 @@ impl Parser<'_> {
                 return Err(self.error("expected ':' after the object key"));
             }
             output.push(':');
-            output.push_str(&self.parse_value()?);
+            output.push_str(&self.parse_value(depth + 1, Some(&key))?);
 
             self.skip_whitespace();
             if self.consume(b'}') {
@@ -88,7 +98,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_array(&mut self) -> Result<String, JsonError> {
+    fn parse_array(&mut self, depth: usize) -> Result<String, JsonError> {
         self.position += 1;
         let mut output = String::from("[");
         self.skip_whitespace();
@@ -98,7 +108,7 @@ impl Parser<'_> {
         }
 
         loop {
-            output.push_str(&self.parse_value()?);
+            output.push_str(&self.parse_value(depth + 1, None)?);
             self.skip_whitespace();
             if self.consume(b']') {
                 output.push(']');
@@ -294,10 +304,10 @@ impl Parser<'_> {
     }
 
     fn error(&self, reason: &'static str) -> JsonError {
-        JsonError {
-            column: self.position + 1,
-            reason,
-        }
+        let column = std::str::from_utf8(&self.input[..self.position])
+            .map_or(self.position, |prefix| prefix.chars().count())
+            + 1;
+        JsonError { column, reason }
     }
 }
 
@@ -375,5 +385,132 @@ mod tests {
         let error = redact_json_line(input, &Redactor::support_safe(), &mut counts).unwrap_err();
 
         assert_eq!(error.reason, "unexpected content after the JSON value");
+    }
+
+    #[test]
+    fn redacts_labelled_json_values_including_escaped_keys() {
+        let input = r#"{"api_key":"abcdefghijklmnop","access\u005ftoken":"qrstuvwxyz123456"}"#;
+        let mut counts = RedactionCounts::default();
+
+        let output = redact_json_line(input, &Redactor::support_safe(), &mut counts).unwrap();
+
+        assert_eq!(
+            output,
+            r#"{"api_key":"[REDACTED_API_KEY]","access_token":"[REDACTED_API_KEY]"}"#
+        );
+        assert_eq!(counts.api_keys, 2);
+
+        let mut second_counts = RedactionCounts::default();
+        let second_output =
+            redact_json_line(&output, &Redactor::support_safe(), &mut second_counts).unwrap();
+        assert_eq!(second_output, output);
+        assert_eq!(second_counts.total(), 0);
+    }
+
+    #[test]
+    fn reports_unicode_aware_source_columns() {
+        let input = "  {\"message\":\"🚀\",\"broken\":}";
+        let mut counts = RedactionCounts::default();
+
+        let error = redact_json_line(input, &Redactor::support_safe(), &mut counts).unwrap_err();
+
+        assert_eq!(error.column, 27);
+    }
+
+    #[test]
+    fn accepts_rfc_number_literal_escape_and_nesting_examples() {
+        let valid = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-0",
+            "1.25",
+            "-2.5e+10",
+            r#""quote: \" slash: \/ control: \b\f\n\r\t""#,
+            r#"{"array":[null,true,false,0,-1.2E-3],"object":{}}"#,
+        ];
+
+        for input in valid {
+            let mut counts = RedactionCounts::default();
+            let output = redact_json_line(input, &Redactor::support_safe(), &mut counts).unwrap();
+            let mut second_counts = RedactionCounts::default();
+            redact_json_line(&output, &Redactor::support_safe(), &mut second_counts).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rfc_number_literal_escape_and_surrogate_examples() {
+        let invalid = [
+            "",
+            "01",
+            "-",
+            "1.",
+            "1e",
+            "True",
+            r#""\x20""#,
+            r#""\ud800""#,
+            r#""\udc00""#,
+            "[1,]",
+            r#"{"a":1,}"#,
+        ];
+
+        for input in invalid {
+            let mut counts = RedactionCounts::default();
+            assert!(
+                redact_json_line(input, &Redactor::support_safe(), &mut counts).is_err(),
+                "expected invalid JSON to be rejected: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_excessive_nesting() {
+        let input = format!("{}0{}", "[".repeat(129), "]".repeat(129));
+        let mut counts = RedactionCounts::default();
+
+        let error = redact_json_line(&input, &Redactor::support_safe(), &mut counts).unwrap_err();
+
+        assert_eq!(
+            error.reason,
+            "JSON nesting exceeds the supported limit of 128"
+        );
+    }
+
+    #[test]
+    fn generated_string_values_round_trip_through_parser_and_encoder() {
+        let mut state = 0x5eed_cafe_u64;
+
+        for _ in 0..512 {
+            let mut value = String::new();
+            for _ in 0..32 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let character = match state % 12 {
+                    0 => '"',
+                    1 => '\\',
+                    2 => '\n',
+                    3 => '\r',
+                    4 => '\t',
+                    5 => '\u{0000}',
+                    6 => 'é',
+                    7 => '🚀',
+                    _ => char::from_u32(0x20 + (state % 0x5f) as u32).unwrap(),
+                };
+                value.push(character);
+            }
+
+            let encoded = super::encode_string(&value);
+            let mut counts = RedactionCounts::default();
+            let output =
+                redact_json_line(&encoded, &Redactor::support_safe(), &mut counts).unwrap();
+            let mut second_counts = RedactionCounts::default();
+            let second_output =
+                redact_json_line(&output, &Redactor::support_safe(), &mut second_counts).unwrap();
+
+            assert_eq!(second_output, output);
+            assert_eq!(second_counts.total(), 0);
+        }
     }
 }

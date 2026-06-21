@@ -13,6 +13,7 @@ pub enum AppError {
     },
     WriteOutput(io::Error),
     FlushOutput(io::Error),
+    CommitOutput(io::Error),
     InvalidJson {
         line: usize,
         column: usize,
@@ -25,7 +26,7 @@ impl fmt::Display for AppError {
         match self {
             Self::SameInputAndOutput => write!(
                 formatter,
-                "the input and output refer to the same path; choose a different output so the source log is not overwritten"
+                "the input and output refer to the same file; choose a different output so the source log is not overwritten"
             ),
             Self::OpenInput(_) => write!(
                 formatter,
@@ -47,6 +48,10 @@ impl fmt::Display for AppError {
                 formatter,
                 "unable to finish writing scrubbed output; the destination may be full or no longer writable"
             ),
+            Self::CommitOutput(_) => write!(
+                formatter,
+                "scrubbing completed but the temporary output could not replace the destination; verify that the destination is writable and is not a directory"
+            ),
             Self::InvalidJson {
                 line,
                 column,
@@ -66,6 +71,7 @@ impl Error for AppError {
             | Self::CreateOutput(source)
             | Self::WriteOutput(source)
             | Self::FlushOutput(source)
+            | Self::CommitOutput(source)
             | Self::ReadInput { source, .. } => Some(source),
             Self::SameInputAndOutput | Self::InvalidJson { .. } => None,
         }
