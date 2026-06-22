@@ -28,6 +28,10 @@ tools.
 - Preserve existing file destinations until the complete input succeeds. Keep
   stdout streaming and document that later failures can leave a scrubbed prefix.
 - Keep the JSON nesting limit explicit and covered by regression tests.
+- Keep the maximum line length explicit and covered by regression tests.
+- Clean up staged file output on normal failures, but document that forced
+  process termination can leave hidden temporary files containing scrubbed
+  output.
 - Keep redaction deterministic. New rules must document their matching
   boundary, replacement marker, and false-positive tradeoff.
 - Use synthetic reserved-domain and documentation-range values in fixtures.

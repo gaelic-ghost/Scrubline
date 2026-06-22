@@ -4,9 +4,9 @@ Scrubline is a fast, deterministic command-line filter for removing
 representative secrets and personal information from logs before they are
 shared with support teams or AI tools.
 
-It reads one line at a time instead of loading the full input into memory.
-Plain text is emitted with its original line endings. JSON Lines input is
-parsed one value per line, scrubbed recursively inside string values, and
+It reads one bounded line at a time instead of loading the full input into
+memory. Plain text is emitted with its original line endings. JSON Lines input
+is parsed one value per line, scrubbed recursively inside string values, and
 serialized back as valid JSONL.
 
 ## Quick start
@@ -42,10 +42,16 @@ Scrubbed content goes to stdout unless `--output` is provided. Aggregate
 counts go to stderr, so reports do not contaminate piped output. Use
 `--no-report` when a silent diagnostic channel is required.
 
-File output is staged in the destination directory and replaces the requested
-path only after the complete input succeeds. Existing output is preserved when
-reading, JSON validation, redaction, or writing fails. Scrubline also rejects
-direct, symbolic-link, and Unix hard-link aliases between input and output.
+File output is staged in a hidden temporary file in the destination directory,
+flushed and synced, and then moved into place only after the complete input
+succeeds. Existing output is preserved when reading, JSON validation,
+redaction, or writing fails. Scrubline also rejects direct, symbolic-link, and
+Unix hard-link aliases between input and output. Normal failures clean up the
+temporary file. Forced process termination, operating-system shutdown, or a
+machine crash can still leave a hidden `.scrubline-*.tmp` file containing
+scrubbed output in the destination directory; remove it only after verifying no
+Scrubline process is still writing there.
+
 Standard output remains truly streaming, so it can contain a successfully
 scrubbed prefix when a later input line fails.
 
@@ -84,10 +90,13 @@ value. Scrubline:
 - preserves `LF`, `CRLF`, or a missing final line ending;
 - accepts only JSON-defined whitespace around values;
 - rejects nesting deeper than 128 levels to bound parser stack use;
+- rejects lines larger than 8 MiB, including any line ending, to bound per-line
+  processing;
 - stops with a line-and-column diagnostic when input is invalid;
 - never copies the malformed source value into that diagnostic.
 
-Blank lines are rejected because they are not JSON values.
+The same 8 MiB line limit applies to plain-text input. Blank JSONL lines are
+rejected because they are not JSON values.
 
 ## Exit status
 

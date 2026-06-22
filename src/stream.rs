@@ -5,6 +5,8 @@ use crate::error::AppError;
 use crate::json::redact_json_line;
 use crate::redact::{RedactionCounts, Redactor};
 
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 pub fn process(
     reader: &mut dyn BufRead,
     writer: &mut dyn Write,
@@ -12,23 +14,19 @@ pub fn process(
     redactor: &Redactor,
 ) -> Result<RedactionCounts, AppError> {
     let mut counts = RedactionCounts::default();
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut line_number = 0;
 
     loop {
-        line.clear();
         line_number += 1;
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|source| AppError::ReadInput {
-                line: line_number,
-                source,
-            })?;
+        let bytes_read = read_bounded_line(reader, &mut line, line_number)?;
         if bytes_read == 0 {
             break;
         }
 
-        let (content, ending) = split_line_ending(&line);
+        let line =
+            std::str::from_utf8(&line).map_err(|_| AppError::InvalidUtf8 { line: line_number })?;
+        let (content, ending) = split_line_ending(line);
         let scrubbed = match format {
             InputFormat::Text => redactor.redact(content, &mut counts),
             InputFormat::Jsonl => {
@@ -61,6 +59,50 @@ pub fn process(
     Ok(counts)
 }
 
+fn read_bounded_line(
+    reader: &mut dyn BufRead,
+    line: &mut Vec<u8>,
+    line_number: usize,
+) -> Result<usize, AppError> {
+    line.clear();
+
+    loop {
+        let available = reader.fill_buf().map_err(|source| AppError::ReadInput {
+            line: line_number,
+            source,
+        })?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+
+        let Some((take, reached_line_end)) = bounded_chunk(line.len(), available) else {
+            return Err(AppError::LineTooLong {
+                line: line_number,
+                limit: MAX_LINE_BYTES,
+            });
+        };
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if reached_line_end {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn bounded_chunk(current_length: usize, available: &[u8]) -> Option<(usize, bool)> {
+    let (requested, reached_line_end) = available
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or((available.len(), false), |offset| (offset + 1, true));
+    let next_length = current_length.checked_add(requested)?;
+    if next_length <= MAX_LINE_BYTES {
+        Some((requested, reached_line_end))
+    } else {
+        None
+    }
+}
+
 fn split_line_ending(line: &str) -> (&str, &str) {
     if let Some(content) = line.strip_suffix("\r\n") {
         (content, "\r\n")
@@ -78,7 +120,7 @@ mod tests {
     use crate::cli::InputFormat;
     use crate::redact::Redactor;
 
-    use super::process;
+    use super::{MAX_LINE_BYTES, process};
 
     #[test]
     fn processes_text_incrementally_and_preserves_line_endings() {
@@ -130,6 +172,42 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("column 1"));
+    }
+
+    #[test]
+    fn rejects_lines_larger_than_the_stream_limit_before_writing_output() {
+        let input = vec![b'a'; MAX_LINE_BYTES + 1];
+        let mut input = Cursor::new(input);
+        let mut output = Vec::new();
+
+        let error = process(
+            &mut input,
+            &mut output,
+            InputFormat::Text,
+            &Redactor::support_safe(),
+        )
+        .unwrap_err();
+
+        assert!(output.is_empty());
+        assert!(error.to_string().contains("input line 1 exceeds"));
+        assert!(!error.to_string().contains("aaaa"));
+    }
+
+    #[test]
+    fn accepts_a_line_at_the_stream_limit() {
+        let input = vec![b'a'; MAX_LINE_BYTES];
+        let mut input = Cursor::new(input);
+        let mut output = Vec::new();
+
+        process(
+            &mut input,
+            &mut output,
+            InputFormat::Text,
+            &Redactor::support_safe(),
+        )
+        .unwrap();
+
+        assert_eq!(output.len(), MAX_LINE_BYTES);
     }
 
     #[test]

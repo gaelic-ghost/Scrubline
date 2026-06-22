@@ -11,6 +11,13 @@ pub enum AppError {
         line: usize,
         source: io::Error,
     },
+    InvalidUtf8 {
+        line: usize,
+    },
+    LineTooLong {
+        line: usize,
+        limit: usize,
+    },
     WriteOutput(io::Error),
     FlushOutput(io::Error),
     CommitOutput(io::Error),
@@ -39,6 +46,14 @@ impl fmt::Display for AppError {
             Self::ReadInput { line, .. } => write!(
                 formatter,
                 "unable to read input near line {line}; the source may not be valid UTF-8 or an I/O error may have interrupted the stream"
+            ),
+            Self::InvalidUtf8 { line } => write!(
+                formatter,
+                "input near line {line} is not valid UTF-8; convert the log to UTF-8 before scrubbing"
+            ),
+            Self::LineTooLong { line, limit } => write!(
+                formatter,
+                "input line {line} exceeds the supported maximum of {limit} bytes; split the log line or use shorter records before scrubbing"
             ),
             Self::WriteOutput(_) => write!(
                 formatter,
@@ -73,7 +88,10 @@ impl Error for AppError {
             | Self::FlushOutput(source)
             | Self::CommitOutput(source)
             | Self::ReadInput { source, .. } => Some(source),
-            Self::SameInputAndOutput | Self::InvalidJson { .. } => None,
+            Self::SameInputAndOutput
+            | Self::InvalidUtf8 { .. }
+            | Self::LineTooLong { .. }
+            | Self::InvalidJson { .. } => None,
         }
     }
 }

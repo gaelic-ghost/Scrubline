@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 static TEMP_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn run_scrubline(arguments: &[&str], input: &str) -> Output {
@@ -140,8 +142,24 @@ fn invalid_utf8_fails_without_echoing_or_emitting_source_bytes() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"{\"ok\":true}\n");
-    assert!(stderr.contains("may not be valid UTF-8"));
+    assert!(stderr.contains("not valid UTF-8"));
     assert!(!stderr.contains("synthetic-private-value"));
+}
+
+#[test]
+fn overlong_line_fails_without_echoing_source_content() {
+    let sensitive_marker = "synthetic-secret-that-must-not-leak";
+    let mut input = Vec::from(sensitive_marker.as_bytes());
+    input.resize(MAX_LINE_BYTES + 1, b'a');
+
+    let output = run_scrubline_bytes(&[], &input);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("input line 1 exceeds the supported maximum"));
+    assert!(stderr.contains("8388608 bytes"));
+    assert!(!stderr.contains(sensitive_marker));
 }
 
 #[test]

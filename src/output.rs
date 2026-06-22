@@ -69,11 +69,12 @@ impl TransactionalOutput {
     }
 
     pub fn commit(mut self) -> Result<(), AppError> {
-        self.file
+        let file = self
+            .file
             .as_mut()
-            .expect("transaction owns its file until commit")
-            .flush()
-            .map_err(AppError::FlushOutput)?;
+            .expect("transaction owns its file until commit");
+        file.flush().map_err(AppError::FlushOutput)?;
+        file.sync_all().map_err(AppError::FlushOutput)?;
         self.file.take();
         fs::rename(&self.temporary, &self.destination).map_err(AppError::CommitOutput)?;
         self.committed = true;
